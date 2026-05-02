@@ -128,7 +128,7 @@ class STAGRNNDenoiser:
         self.use_temporal_attention = kwargs.pop('use_temporal_attention', True)
         self.use_spatial_attention = kwargs.pop('use_spatial_attention', True)
         self.graph_loader = kwargs.get('graph_loader', False)
-        self.spatial_weights_path = r'D:\see-dn\sse-dn_AGCRN_new\spatial_weights.joblib'
+        self.spatial_weights_path = r'/root/autodl-tmp/data/spatial_weights.joblib'
 
     def _callbacks(self, stagename):
         from torch.utils.tensorboard import SummaryWriter
@@ -260,8 +260,11 @@ class STAGRNNDenoiser:
             # 最后对 Batch 维度和 Feature (东西向/南北向) 维度求均值，化为一个标量
             spatial_penalty = torch.mean(spatial_penalty_per_batch)
 
-        # 最终整合 (custom_loss_coeff 为超参数，用于平衡两个 Loss)
-        total_loss = mse_loss + self.custom_loss_coeff * spatial_penalty
+        # 最终整合 (spatial_loss_coeff 为超参数，用于平衡两个 Loss)
+        total_loss = mse_loss + self.spatial_loss_coeff * spatial_penalty
+        # --- 新增：把当前 batch 的分项 loss 存入实例属性 ---
+        self.current_mse = mse_loss.item()
+        self.current_spatial = spatial_penalty.item() if isinstance(spatial_penalty, torch.Tensor) else spatial_penalty
         
         return total_loss
 
@@ -269,12 +272,11 @@ class STAGRNNDenoiser:
 
     def associate_optimizer(self):
         """绑定优化器与损失函数"""
-        # 判断使用哪种 Loss
         if self.use_spatial_loss:
             print(f"-> 启用空间去相关约束损失 (系数: {self.spatial_loss_coeff})")
             self.loss = self.spatio_temporal_loss
         elif self.custom_loss:
-            self.loss = self.ang_loss # 你原有的角度损失
+            self.loss = self.ang_loss
         else:
             self.loss = torch.nn.MSELoss()
 
@@ -290,6 +292,8 @@ class STAGRNNDenoiser:
 
     def train_epoch(self, progress_bar):
         running_loss = 0.
+        running_mse = 0.      # 新增
+        running_spatial = 0.  # 新增
 
         for i, data in enumerate(self.train_loader):
             self.optimizer.zero_grad()
@@ -298,20 +302,34 @@ class STAGRNNDenoiser:
 
             if not self.custom_loss:
                 y = data[1].to(self.device)
-                loss = self.loss(outputs, y)
+                loss = self.loss(outputs, y) # 注意：保持你修复过的参数顺序
             else:
                 y = data[1].to(self.device)
-                # 计算首末两端的差值作为静态位移场
                 y_disp = (data[1][:, :, -1, :] - data[1][:, :, 0, :]).to(self.device)
                 pred_disp = (outputs[:, :, -1, :] - outputs[:, :, 0, :]).to(self.device)
                 loss = self.loss(y, outputs, y_disp, pred_disp)
 
             loss.backward()
             self.optimizer.step()
+            
             running_loss += loss.item()
-            progress_bar.update(i, values=[("loss: ", float(f'{loss.item():.4f}'))])
 
-        return running_loss / len(self.train_loader)
+            # --- 新增：读取并累加当前 batch 的分项 Loss ---
+            curr_mse = getattr(self, 'current_mse', 0.0)
+            curr_spat = getattr(self, 'current_spatial', 0.0)
+            running_mse += curr_mse
+            running_spatial += curr_spat
+
+            # --- 修改：让进度条实时显示这三个指标 ---
+            progress_bar.update(i, values=[
+                ("loss", loss.item()), 
+                ("mse", curr_mse), 
+                ("spatial", curr_spat)
+            ])
+
+        # --- 修改：在 Epoch 结束时，把三个平均值一起返回 ---
+        n_batches = len(self.train_loader)
+        return running_loss / n_batches, running_mse / n_batches, running_spatial / n_batches
 
     def minibatch_train(self):
         best_vloss = 1_000_000.
@@ -321,8 +339,9 @@ class STAGRNNDenoiser:
                                       verbose=self.train_verbosity_level)
 
             self.model.train()
-            avg_train_loss = self.train_epoch(progress_bar)
+            avg_train_loss, avg_train_mse, avg_train_spatial = self.train_epoch(progress_bar)
             progress_bar.add(1)
+            
 
             self.model.eval()
             with torch.no_grad():
@@ -364,8 +383,12 @@ class STAGRNNDenoiser:
                 best_vloss = avg_vloss
                 torch.save(self.model.state_dict(), self.weight_path)
 
-            progress_bar.add(1, values=[("loss: ", float(f'{avg_train_loss:.4f}')),
-                                        ("val_loss: ", float(f'{avg_vloss:.4f}'))])
+            progress_bar.add(1, values=[
+                ("loss", avg_train_loss),
+                ("val_loss", avg_vloss),
+                ("mse", avg_train_mse),
+                ("spatial", avg_train_spatial)
+            ])
 
     def inference(self):
         test_pred = np.zeros(self.y_test.shape)
