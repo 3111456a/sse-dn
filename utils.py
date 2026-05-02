@@ -577,47 +577,48 @@ def _full_time_series_denoising_plots(X_test_loader, y_test, y_pred, cat, statio
     one_disloc_idx = 11  # 6
     two_disloc_idx = 9  # 11
     three_disloc_idx = 15  # 3'''
+    import torch # 确保有 torch
+    # 1. 在全局的 validation catalogue 中寻找特定的事件类型的全局索引
     no_disloc_idx, one_disloc_idx, two_disloc_idx, three_disloc_idx = None, None, None, None
     for i in range(len(cat)):
-        if len(cat[i][0]) == 0:
-            no_disloc_idx = i
-
-        if len(cat[i][0]) == 1:
-            one_disloc_idx = i
-
-        if len(cat[i][0]) == 2:
-            two_disloc_idx = i
-
-        if len(cat[i][0]) == 3:
-            three_disloc_idx = i
-        if no_disloc_idx is not None and one_disloc_idx is not None and two_disloc_idx is not None and three_disloc_idx is not None:
+        if len(cat[i][0]) == 0 and no_disloc_idx is None: no_disloc_idx = i
+        if len(cat[i][0]) == 1 and one_disloc_idx is None: one_disloc_idx = i
+        if len(cat[i][0]) == 2 and two_disloc_idx is None: two_disloc_idx = i
+        if len(cat[i][0]) == 3 and three_disloc_idx is None: three_disloc_idx = i
+        if all(v is not None for v in [no_disloc_idx, one_disloc_idx, two_disloc_idx, three_disloc_idx]):
             break
 
-    for i in range(100):  # modify after
-        if len(cat[i][0]) == 10:
-            one_disloc_idx = i
+    # 防止找不到对应事件报错，给个默认值 0
+    if no_disloc_idx is None: no_disloc_idx = 0
+    if one_disloc_idx is None: one_disloc_idx = min(1, len(cat)-1)
+    if two_disloc_idx is None: two_disloc_idx = min(2, len(cat)-1)
+    if three_disloc_idx is None: three_disloc_idx = min(3, len(cat)-1)
 
-        if len(cat[i][0]) == 20:
-            two_disloc_idx = i
+    # 2. 核心修复：不要从 Batch 里拿数据！直接从底层的 Dataset 里用全局索引精确拿取
+    dataset = X_test_loader.dataset
+    
+    def get_numpy_x(idx):
+        # 取出单个样本的 x，并转换为 numpy 数组
+        x_tensor = dataset[idx][0]
+        return x_tensor.cpu().numpy() if torch.is_tensor(x_tensor) else x_tensor
 
-        if len(cat[i][0]) == 30:
-            three_disloc_idx = i
-
-    for i, d in enumerate(X_test_loader):
-        X_test = d[0]
-        break
+    X_no_disloc = get_numpy_x(no_disloc_idx)
+    X_one_disloc = get_numpy_x(one_disloc_idx)
+    X_two_disloc = get_numpy_x(two_disloc_idx)
+    X_three_disloc = get_numpy_x(three_disloc_idx)
 
     latsort = np.argsort(station_coordinates[:, 0])
 
+    # 3. 绘图代码保持不变，只替换变量名
     figure, axis = plt.subplots(4, 3, figsize=(11, 14))
     cmap = matplotlib.cm.get_cmap("RdBu_r").copy()
     vmin, vmax = -5, 10
     norm = matplotlib.colors.TwoSlopeNorm(vmin=vmin, vcenter=0., vmax=vmax)
     cmap.set_bad('black', 1.)
-
     norm_other = matplotlib.colors.TwoSlopeNorm(vmin=vmin, vcenter=0., vmax=vmax)
 
-    m = axis[0][0].matshow(X_test[no_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm)
+    # 第一行：No Dislocation
+    m = axis[0][0].matshow(X_no_disloc[latsort, :, direction], cmap=cmap, norm=norm)
     plt.colorbar(m, ax=axis[0][0])
     m = axis[0][1].matshow(y_test[no_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[0][1])
@@ -625,33 +626,38 @@ def _full_time_series_denoising_plots(X_test_loader, y_test, y_pred, cat, statio
     plt.colorbar(m, ax=axis[0][2])
     axis[0][2].title.set_text(f'No dislocation')
 
-    m = axis[1][0].matshow(X_test[one_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm)
+    # 第二行：One Dislocation
+    m = axis[1][0].matshow(X_one_disloc[latsort, :, direction], cmap=cmap, norm=norm)
     plt.colorbar(m, ax=axis[1][0])
     m = axis[1][1].matshow(y_test[one_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[1][1])
     m = axis[1][2].matshow(y_pred[one_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[1][2])
-    axis[1][2].title.set_text(f'Mw {cat[one_disloc_idx][3][0]:.2f}')
+    # 增加越界保护
+    title_1 = f'Mw {cat[one_disloc_idx][3][0]:.2f}' if len(cat[one_disloc_idx][3]) > 0 else 'One Disloc'
+    axis[1][2].title.set_text(title_1)
 
-    m = axis[2][0].matshow(X_test[two_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm)
+    # 第三行：Two Dislocations
+    m = axis[2][0].matshow(X_two_disloc[latsort, :, direction], cmap=cmap, norm=norm)
     plt.colorbar(m, ax=axis[2][0])
     m = axis[2][1].matshow(y_test[two_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[2][1])
     m = axis[2][2].matshow(y_pred[two_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[2][2])
-    axis[2][2].title.set_text(f'Mw {cat[two_disloc_idx][3][0]:.2f}, {cat[two_disloc_idx][3][1]:.2f}')
+    title_2 = f'Mw {cat[two_disloc_idx][3][0]:.2f}, {cat[two_disloc_idx][3][1]:.2f}' if len(cat[two_disloc_idx][3]) > 1 else 'Two Disloc'
+    axis[2][2].title.set_text(title_2)
 
-    m = axis[3][0].matshow(X_test[three_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm)
+    # 第四行：Three Dislocations
+    m = axis[3][0].matshow(X_three_disloc[latsort, :, direction], cmap=cmap, norm=norm)
     plt.colorbar(m, ax=axis[3][0])
     m = axis[3][1].matshow(y_test[three_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[3][1])
     m = axis[3][2].matshow(y_pred[three_disloc_idx, latsort, :, direction], cmap=cmap, norm=norm_other)
     plt.colorbar(m, ax=axis[3][2])
-    axis[3][2].title.set_text(
-        f'Mw {cat[three_disloc_idx][3][0]:.2f}, {cat[three_disloc_idx][3][1]:.2f}, {cat[three_disloc_idx][3][2]:.2f}')
+    title_3 = f'Mw {cat[three_disloc_idx][3][0]:.2f}, {cat[three_disloc_idx][3][1]:.2f}, {cat[three_disloc_idx][3][2]:.2f}' if len(cat[three_disloc_idx][3]) > 2 else 'Three Disloc'
+    axis[3][2].title.set_text(title_3)
 
     plt.tight_layout()
-
     return figure
 
 

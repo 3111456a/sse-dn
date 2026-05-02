@@ -416,9 +416,13 @@ class STAGRNNDenoiser:
         # --- 修改：在 Epoch 结束时，把三个平均值一起返回 ---
         n_batches = len(self.train_loader)
         return running_loss / n_batches, running_mse / n_batches, running_spatial / n_batches
-
+# 实现了早停
     def minibatch_train(self):
         best_vloss = 1_000_000.
+        
+        # --- 新增：初始化早停计数器 ---
+        epochs_no_improve = 0 
+        
         for epoch in range(self.n_epochs):
             print(f"Epoch {epoch + 1}/{self.n_epochs}")
             progress_bar = pkbar.Kbar(target=len(self.train_loader), always_stateful=False, width=25,
@@ -428,7 +432,6 @@ class STAGRNNDenoiser:
             avg_train_loss, avg_train_mse, avg_train_spatial = self.train_epoch(progress_bar)
             progress_bar.add(1)
             
-
             self.model.eval()
             with torch.no_grad():
                 running_vloss = 0.0
@@ -439,12 +442,13 @@ class STAGRNNDenoiser:
                     voutputs = self.model(vdata[0].to(self.device))
 
                     if not self.custom_loss:
+                        # 注意：验证集也需要修正参数顺序 (ts_pred, ts_true)
                         vloss = self.loss(voutputs, vdata[1].to(self.device)).item()
                     else:
                         y = vdata[1].to(self.device)
                         y_disp = (vdata[1][:, :, -1, :] - vdata[1][:, :, 0, :]).to(self.device)
                         pred_disp = (voutputs[:, :, -1, :] - voutputs[:, :, 0, :]).to(self.device)
-                        vloss = self.loss(y, voutputs, y_disp, pred_disp).item()
+                        vloss = self.loss(voutputs, y, pred_disp, y_disp).item()
 
                     running_vloss += vloss
 
@@ -465,16 +469,23 @@ class STAGRNNDenoiser:
             self.img_writer.add_figure('denoising', figure_disp, epoch + 1, close=True)
             self.img_writer.flush()
 
-            if avg_vloss < best_vloss:
-                best_vloss = avg_vloss
-                torch.save(self.model.state_dict(), self.weight_path)
-
             progress_bar.add(1, values=[
                 ("loss", avg_train_loss),
                 ("val_loss", avg_vloss),
                 ("mse", avg_train_mse),
                 ("spatial", avg_train_spatial)
             ])
+
+            # --- 修改：早停判断与权重保存逻辑 ---
+            if avg_vloss < best_vloss:
+                best_vloss = avg_vloss
+                epochs_no_improve = 0  # 重置计数器
+                torch.save(self.model.state_dict(), self.weight_path)
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= self.patience:
+                    print(f"\nEarly stopping triggered! Validation loss hasn't improved for {self.patience} epochs.")
+                    break # 跳出 epoch 循环
 
     def inference(self):
         test_pred = np.zeros(self.y_test.shape)
