@@ -102,6 +102,12 @@ class STAGRNNDenoiser:
         self.val_catalogue = kwargs.get('val_catalogue', None)
         self.custom_loss_coeff = kwargs.get('custom_loss_coeff', 1)
 
+        # ---------- 新增：空间损失开关与系数 ----------
+        self.use_spatial_loss = kwargs.get('use_spatial_loss', True)
+        # 惩罚系数非常重要，用于平衡 MSE 和 空间NCC 的量级
+        self.spatial_loss_coeff = kwargs.get('spatial_loss_coeff', 0.01) 
+        # ---------------------------------------------
+
         self.train_loader = None
         self.val_loader = None
         self.test_loader = None
@@ -122,6 +128,7 @@ class STAGRNNDenoiser:
         self.use_temporal_attention = kwargs.pop('use_temporal_attention', True)
         self.use_spatial_attention = kwargs.pop('use_spatial_attention', True)
         self.graph_loader = kwargs.get('graph_loader', False)
+        self.spatial_weights_path = r'D:\see-dn\sse-dn_AGCRN_new\spatial_weights.joblib'
 
     def _callbacks(self, stagename):
         from torch.utils.tensorboard import SummaryWriter
@@ -142,6 +149,15 @@ class STAGRNNDenoiser:
         self.tb_writer = SummaryWriter(log_dir)
         self.img_writer = SummaryWriter(os.path.join(log_dir, 'img'))
 
+    def load_spatial_weights(self):
+        import joblib
+        if os.path.exists(self.spatial_weights_path):
+            print(f"Loading spatial weights from {self.spatial_weights_path}")
+            data = joblib.load(self.spatial_weights_path)
+            w_np = data['weight_matrix']
+            self.W_matrix = torch.tensor(w_np, dtype=torch.float32, device=self.device, requires_grad=False)
+        else:
+            raise FileNotFoundError(f"未找到空间权重文件: {self.spatial_weights_path}。请先运行生成脚本。")
     def build(self):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = STAGRNNDenoiserModel(return_attention=self.return_attention,
@@ -151,6 +167,9 @@ class STAGRNNDenoiser:
         model.to(device)
         self.device = device
         self.model = model
+        # --- 必须加这一行，把计算好的矩阵丢进 GPU ---
+        if self.use_spatial_loss:
+            self.load_spatial_weights()
 
     def summary(self, x):
         print(torch_geometric.nn.summary(self.model, x.to(self.device), max_depth=1))
@@ -184,13 +203,82 @@ class STAGRNNDenoiser:
 
         return ts_misfit + self.custom_loss_coeff * angular_misfit
 
+    # 新添加的带空间物理约束的loss，距离越大的台站如果显示出近似的位移速率，loss上升，为了区分共模噪声和sse
+    def spatio_temporal_loss(self, ts_pred,ts_true):
+        """
+        综合损失函数: MSE + 软阈值空间去相关惩罚 (Soft-Margin Distance Decay Loss)
+        """
+        # 1. 基础重建损失
+        mse_loss = torch.nn.functional.mse_loss(ts_pred, ts_true)
+
+        spatial_penalty = 0.0
+        
+        if self.use_spatial_loss:
+            if self.W_matrix is None:
+                raise ValueError("未找到空间权重矩阵 self.W_matrix")
+                
+            # 【第二类：动态预测参数】计算近似速度
+            # 维度: (Batch, N, Time_diff, Feat)
+            v_pred = ts_pred[:, :, 1:, :] - ts_pred[:, :, :-1, :]
+            
+            # 提取时间轴长度 (也就是公式隐含的 T)
+            T_diff = v_pred.shape[2] 
+            
+            # 【第三类：统计量参数】
+            mu_v = torch.mean(v_pred, dim=2, keepdim=True)
+            v_centered = v_pred - mu_v
+            sigma_v = torch.std(v_pred, dim=2, unbiased=False, keepdim=True)
+            epsilon = 1e-8
+            
+            # 归一化序列: (Batch, N, Time_diff, Feat)
+            v_norm = v_centered / (sigma_v + epsilon)
+            
+            # -----------------------------------------------------
+            # 【完美对齐公式的矩阵运算】
+            # -----------------------------------------------------
+            # 1. 计算 NCC (归一化互相关) 矩阵
+            # 用 einsum 计算批次内所有台站对在时间轴 (t) 上的点积，保留 (b:Batch, i:站i, j:站j, f:特征)
+            # 除以 T_diff 确保结果严格落在 [-1, 1] 之间！
+            ncc_matrix = torch.einsum('bitf,bjtf->bijf', v_norm, v_norm) / T_diff
+            
+            # 2. 纯形态平方 (括号外的 ^2)
+            # 将相关系数映射到 [0, 1]，无论是正相关还是负相关，都会产生惩罚
+            ncc_squared = ncc_matrix ** 2
+            
+            # 3. 施加空间惩罚权重 (W_i,j)
+            # self.W_matrix 维度是 (N, N)，需要 reshape 匹配 (Batch, N, N, Feat) 以便广播相乘
+            W_expanded = self.W_matrix.unsqueeze(0).unsqueeze(-1)
+            penalty_matrix = W_expanded * ncc_squared
+            
+            # 4. 外层求和与平均 (1 / N(N-1) \sum_{i!=j})
+            # - 在维度 1 (i) 和 2 (j) 上求和，即 sum_{i!=j} 
+            #   (因为在预处理时，W_matrix 对角线已经是 0 了，所以可以直接整体 sum)
+            # - 除以 N * (N - 1)
+            N = self.W_matrix.shape[0]
+            spatial_penalty_per_batch = torch.sum(penalty_matrix, dim=(1, 2)) / (N * (N - 1))
+            
+            # 最后对 Batch 维度和 Feature (东西向/南北向) 维度求均值，化为一个标量
+            spatial_penalty = torch.mean(spatial_penalty_per_batch)
+
+        # 最终整合 (custom_loss_coeff 为超参数，用于平衡两个 Loss)
+        total_loss = mse_loss + self.custom_loss_coeff * spatial_penalty
+        
+        return total_loss
+
+
+
     def associate_optimizer(self):
-        if self.custom_loss:
-            self.loss = self.ang_loss
+        """绑定优化器与损失函数"""
+        # 判断使用哪种 Loss
+        if self.use_spatial_loss:
+            print(f"-> 启用空间去相关约束损失 (系数: {self.spatial_loss_coeff})")
+            self.loss = self.spatio_temporal_loss
+        elif self.custom_loss:
+            self.loss = self.ang_loss # 你原有的角度损失
         else:
             self.loss = torch.nn.MSELoss()
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), self.initial_learning_rate)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.initial_learning_rate)
 
     def set_callbacks(self, train_codename):
         self._callbacks(train_codename)
