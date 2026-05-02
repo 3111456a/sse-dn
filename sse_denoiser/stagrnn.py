@@ -1,6 +1,6 @@
 import datetime
 import os
-
+import joblib  # 新增：用于保存矩阵到本地
 import numpy as np
 import pkbar
 import torch
@@ -9,7 +9,7 @@ from local_tsl.nn.blocks.encoders.recurrent.agcrn import AGCRN
 
 from sse_denoiser.spatio_temporal_transformer import Transformer as SpatioTemporalTransformer
 from utils import denoising_plots
-
+from geopy.distance import geodesic # 新增，用于计算地球表面真实弧面距离
 
 class STAGRNNDenoiserModel(torch.nn.Module):
     """
@@ -102,11 +102,23 @@ class STAGRNNDenoiser:
         self.val_catalogue = kwargs.get('val_catalogue', None)
         self.custom_loss_coeff = kwargs.get('custom_loss_coeff', 1)
 
+<<<<<<< HEAD
         # ---------- 新增：空间损失开关与系数 ----------
         self.use_spatial_loss = kwargs.get('use_spatial_loss', True)
         # 惩罚系数非常重要，用于平衡 MSE 和 空间NCC 的量级
         self.spatial_loss_coeff = kwargs.get('spatial_loss_coeff', 0.01) 
         # ---------------------------------------------
+=======
+
+        # ---------- 新增：软阈值空间惩罚超参数 ----------
+        self.d_threshold = kwargs.get('d_threshold', 400.0)
+        self.alpha = kwargs.get('alpha', 0.05)
+        # 默认保存到工作目录下的 weights 文件夹中
+        self.spatial_weights_path = kwargs.get('spatial_weights_path', './spatial_weights.joblib')
+        self.W_matrix = None
+        # -----------------------------------------------
+
+>>>>>>> 15f65024881de2b7efc7ff3f786149936e5b9413
 
         self.train_loader = None
         self.val_loader = None
@@ -129,6 +141,73 @@ class STAGRNNDenoiser:
         self.use_spatial_attention = kwargs.pop('use_spatial_attention', True)
         self.graph_loader = kwargs.get('graph_loader', False)
         self.spatial_weights_path = r'/root/autodl-tmp/data/spatial_weights.joblib'
+
+    def _compute_spatial_weights(self):
+        """
+        计算并保存静态空间权重矩阵 W_ij
+        """
+        if self.station_coordinates is None:
+            raise ValueError("错误：未提供 station_coordinates，无法计算空间权重。")
+
+        # 1. 获取台站总数 N (例如 200)
+        coords = self.station_coordinates
+        N = coords.shape[0]
+        
+        # 2. 计算 D_{i,j} 距离矩阵 (单位: km)
+        # 注意：geodesic 接收 (lat, lon)
+        dist_matrix = np.zeros((N, N))
+        print(f"正在为 {N} 个台站预计算球面距离矩阵...")
+        
+        for i in range(N):
+            for j in range(i + 1, N): # 利用对称性减少一半计算量
+                d = geodesic(
+                    (coords[i, 0], coords[i, 1]), 
+                    (coords[j, 0], coords[j, 1])
+                ).km
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+
+        # 3. 计算 W_{i,j} 平滑惩罚权重
+        # 公式: W = 1 / (1 + exp(-alpha * (D - D_threshold)))
+        W = 1.0 / (1.0 + np.exp(-self.alpha * (dist_matrix - self.d_threshold)))
+        
+        # 4. 物理约束：自己对自己不计算相关性惩罚 (对角线设为0)
+        np.fill_diagonal(W, 0.0)
+
+        # 5. 保存到本地
+        save_dir = os.path.dirname(self.spatial_weights_path)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        joblib.dump({
+            'weight_matrix': W,
+            'distance_matrix': dist_matrix,
+            'alpha': self.alpha,
+            'd_threshold': self.d_threshold,
+            'station_coordinates': coords
+        }, self.spatial_weights_path)
+        
+        print(f"成功：空间权重矩阵已保存至 {self.spatial_weights_path}")
+        return W
+
+    def setup_spatial_weights(self):
+        """
+        统筹空间权重的获取：
+        1. 检查本地是否存在保存好的权重文件。
+        2. 若存在，直接读取；若不存在，调用计算函数并保存。
+        3. 将 numpy 矩阵转换为 tensor 并挂载到 GPU/CPU。
+        """
+        if os.path.exists(self.spatial_weights_path):
+            print(f"-> 检测到本地缓存，直接读取空间权重矩阵: {self.spatial_weights_path}")
+            data = joblib.load(self.spatial_weights_path)
+            w_np = data['weight_matrix']
+        else:
+            print("-> 未检测到本地缓存，开始首次计算空间权重矩阵...")
+            w_np = self._compute_spatial_weights()  # 这个函数里已经包含了 joblib.dump 保存逻辑
+            
+        # 将矩阵转换为 PyTorch Tensor，并发送到模型所在的 Device
+        self.W_matrix = torch.tensor(w_np, dtype=torch.float32, device=self.device, requires_grad=False)
+        print("-> 静态空间距离权重矩阵 (W_matrix) 已成功挂载至设备。")
 
     def _callbacks(self, stagename):
         from torch.utils.tensorboard import SummaryWriter
@@ -167,9 +246,16 @@ class STAGRNNDenoiser:
         model.to(device)
         self.device = device
         self.model = model
+<<<<<<< HEAD
         # --- 必须加这一行，把计算好的矩阵丢进 GPU ---
         if self.use_spatial_loss:
             self.load_spatial_weights()
+=======
+        # ---------- 新增：初始化空间权重矩阵 (一行调用，方便注释) ----------
+        if self.custom_loss:
+            self.setup_spatial_weights() 
+        # ----------------------------------------------------------------
+>>>>>>> 15f65024881de2b7efc7ff3f786149936e5b9413
 
     def summary(self, x):
         print(torch_geometric.nn.summary(self.model, x.to(self.device), max_depth=1))
