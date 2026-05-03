@@ -102,24 +102,16 @@ class STAGRNNDenoiser:
         self.val_catalogue = kwargs.get('val_catalogue', None)
         self.custom_loss_coeff = kwargs.get('custom_loss_coeff', 1)
 
-<<<<<<< HEAD
+
         # ---------- 新增：空间损失开关与系数 ----------
-        self.use_spatial_loss = kwargs.get('use_spatial_loss', True)
+        self.use_spatial_loss = kwargs.get('use_spatial_loss', False)
         # 惩罚系数非常重要，用于平衡 MSE 和 空间NCC 的量级
         self.spatial_loss_coeff = kwargs.get('spatial_loss_coeff', 0.01) 
         # ---------------------------------------------
-=======
-
-        # ---------- 新增：软阈值空间惩罚超参数 ----------
-        self.d_threshold = kwargs.get('d_threshold', 400.0)
-        self.alpha = kwargs.get('alpha', 0.05)
-        # 默认保存到工作目录下的 weights 文件夹中
-        self.spatial_weights_path = kwargs.get('spatial_weights_path', './spatial_weights.joblib')
-        self.W_matrix = None
-        # -----------------------------------------------
-
->>>>>>> 15f65024881de2b7efc7ff3f786149936e5b9413
-
+        # 新增时间阶跃约束，预测与真实最后一天的差距
+        self.temporal_offset_weight = kwargs.get('temporal_offset_weight', 20.0)
+        self.use_temporal_loss = kwargs.get('use_temporal_loss', True)
+        
         self.train_loader = None
         self.val_loader = None
         self.test_loader = None
@@ -246,16 +238,9 @@ class STAGRNNDenoiser:
         model.to(device)
         self.device = device
         self.model = model
-<<<<<<< HEAD
         # --- 必须加这一行，把计算好的矩阵丢进 GPU ---
         if self.use_spatial_loss:
             self.load_spatial_weights()
-=======
-        # ---------- 新增：初始化空间权重矩阵 (一行调用，方便注释) ----------
-        if self.custom_loss:
-            self.setup_spatial_weights() 
-        # ----------------------------------------------------------------
->>>>>>> 15f65024881de2b7efc7ff3f786149936e5b9413
 
     def summary(self, x):
         print(torch_geometric.nn.summary(self.model, x.to(self.device), max_depth=1))
@@ -288,6 +273,25 @@ class STAGRNNDenoiser:
         angular_misfit = arccos.mean()
 
         return ts_misfit + self.custom_loss_coeff * angular_misfit
+
+
+    def mse_temporal_loss(self, ts_pred, ts_true):
+        # 1. 必须先计算基础的整体波形 MSE
+        mse_loss = torch.nn.functional.mse_loss(ts_pred, ts_true)
+        
+        # 2. 提取首尾差值
+        pred_offset = ts_pred[:, :, -1, :] - ts_pred[:, :, 0, :]
+        true_offset = ts_true[:, :, -1, :] - ts_true[:, :, 0, :]
+        
+        # 3. 计算 offset 损失
+        offset_loss = torch.nn.functional.mse_loss(pred_offset, true_offset)
+        
+        # 4. 融合返回
+        total_loss = mse_loss + self.temporal_offset_weight * offset_loss
+        
+        
+        return total_loss
+        # ---------------------------------------------------------           
 
     # 新添加的带空间物理约束的loss，距离越大的台站如果显示出近似的位移速率，loss上升，为了区分共模噪声和sse
     def spatio_temporal_loss(self, ts_pred,ts_true):
@@ -363,6 +367,8 @@ class STAGRNNDenoiser:
             self.loss = self.spatio_temporal_loss
         elif self.custom_loss:
             self.loss = self.ang_loss
+        elif self.use_temporal_loss:
+            self.loss = self.mse_temporal_loss
         else:
             self.loss = torch.nn.MSELoss()
 

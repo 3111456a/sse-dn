@@ -108,7 +108,7 @@ def binned_err(label, prediction):
     errors = []
     n_obs, _, n_time, _ = label.shape
     if n_obs == 0:
-        return np.nan
+        return np.nan, np.nan
     for i in range(n_obs):
         valid_station_indices = np.where(label[i].sum(axis=(1, 2)) != 0)[0]  # stations with nonzero displacement
         static_disp_label = label[i][valid_station_indices, -1, :] - label[i][valid_station_indices, 0, :]
@@ -304,21 +304,54 @@ def compute_absolute_error_predictions(labels, prediction_list):
         error_list.append(error)
     return error_list
 
+def _absolute_error_active_only(original, predicted):
+    """
+    只计算有真实 SSE 位移发生的台站的 MAE，剔除全 0 的背景台站。
+    """
+    m, n_stations, n_time, n_dir = original.shape
+    errors = []
+    
+    for i in range(m):
+        # 找出当前时间窗口中，真实发生了位移的台站索引
+        valid_station_indices = np.where(np.sum(np.abs(original[i]), axis=(1, 2)) != 0)[0]
+        
+        if len(valid_station_indices) > 0:
+            # 仅在这些活跃台站上计算绝对误差
+            active_orig = original[i, valid_station_indices, :, :]
+            active_pred = predicted[i, valid_station_indices, :, :]
+            err = np.mean(np.abs(active_orig - active_pred))
+            errors.append(err)
+            
+    # 返回所有包含活跃信号样本的平均误差
+    return np.array(errors) if errors else np.array([np.nan])
+
+def compute_absolute_error_predictions_fixed(labels, prediction_list):
+    """
+    调用改进后的底层误差计算函数
+    """
+    error_list = []
+    for prediction in prediction_list:
+        error = _absolute_error_active_only(labels, prediction)
+        error_list.append(error)
+    return error_list
 
 def statistics_table(data, labels, predictions, save=False):
-    '''rmse_errors = compute_rmse_predictions(labels, predictions, mse=False)
-    mae_errors = compute_mae_predictions(labels, predictions)
-    print(rmse_errors)
-    print(mae_errors)'''
-
+    # MSE 这里其实也有被稀释的问题，但我们先集中解决 MAE
     squared_errors = compute_squared_error_predictions(labels, predictions)
-    absolute_errors = compute_absolute_error_predictions(labels, predictions)
+    
+    # 【核心修改】：在这里调用我们刚刚定义的 compute_absolute_error_predictions_fixed
+    absolute_errors = compute_absolute_error_predictions_fixed(labels, predictions) 
 
-    table = PrettyTable(['Model', 'MSE', 'MAE'])
+    # 把表头改一下，明确我们计算的是活跃台站的 MAE
+    # 将 .2f 改为 .4f 或者科学计数法 .2e
+    table = PrettyTable(['Model', 'MSE ± std_se', 'MAE ± std_ae (Active Only)'])
     for i, model in enumerate(models):
-        table.add_row([model, f'{squared_errors[i].mean():.2f}', f'{absolute_errors[i].mean():.2f}'])
+        table.add_row([
+            model, 
+            f'{squared_errors[i].mean():.4f} ± {squared_errors[i].std():.4f}', # 提高精度
+            f'{absolute_errors[i].mean():.4f} ± {absolute_errors[i].std():.4f}'  # 提高精度
+        ])
     print(table)
-
     table = PrettyTable(['Model', 'MSE ± std_se', 'MAE ± std_ae'])
     for i, model in enumerate(models):
         table.add_row([model, f'{squared_errors[i].mean():.2f} ± {squared_errors[i].std():.2f}',
